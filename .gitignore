@@ -1,0 +1,24 @@
+# ESP-IDF build outputs and local configuration
+/build/
+/build_*/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig_old*
+
+# Private credentials
+/main/app_secrets.h
+
+# Nested VCS metadata and editor/OS files
+**/.git/
+**/.git.local-backup/
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local experiments from the development workspace
+/build_v3.sh
+/flash_v3.sh
+/reflash.sh
+/reflash2.sh
