@@ -458,4 +458,656 @@ weather_air_quality_t* weather_get_air_quality(weather_config_t *config)
         result->available = result->aqi[0] || result->category[0];
     }
     cJSON_Delete(root);
-    if (result-
+    if (result->available)
+        ESP_LOGI(TAG, "Air quality AQI: %s %s", result->aqi, result->category);
+    else
+        ESP_LOGW(TAG, "Air quality data unavailable");
+    return result;
+}
+
+void weather_air_quality_free(weather_air_quality_t *air_quality)
+{
+    free(air_quality);
+}
+
+weather_alerts_t* weather_get_alerts(weather_config_t *config)
+{
+    weather_alerts_t *result = calloc(1, sizeof(*result));
+    if (!result) return NULL;
+    if (!config || config->type != WEATHER_HEFENG || !config->api_host || !config->api_key) return result;
+
+    char lat[20] = {0}, lon[20] = {0};
+    if (!get_hefeng_coordinates(config, lat, sizeof(lat), lon, sizeof(lon))) {
+        ESP_LOGW(TAG, "Weather alert location lookup failed");
+        return result;
+    }
+
+    char url[320];
+    snprintf(url, sizeof(url), "https://%s/weatheralert/v1/current/%s/%s?key=%s&lang=zh",
+             config->api_host, lat, lon, config->api_key);
+    char *response = weather_http_request(url);
+    if (!response) return result;
+    cJSON *root = cJSON_Parse(response);
+    free(response);
+    if (!root) return result;
+
+    cJSON *metadata = cJSON_GetObjectItem(root, "metadata");
+    cJSON *code = cJSON_GetObjectItem(root, "code");
+    bool response_ok = metadata != NULL || (code && cJSON_IsString(code) && strcmp(code->valuestring, "200") == 0);
+    cJSON *alerts = cJSON_GetObjectItem(root, "alerts");
+    if (response_ok) {
+        result->available = true;
+        if (cJSON_IsArray(alerts)) {
+            int n = cJSON_GetArraySize(alerts);
+            for (int i = 0; i < n && result->count < WEATHER_ALERT_MAX; ++i) {
+                cJSON *item = cJSON_GetArrayItem(alerts, i);
+                cJSON *message_type = item ? cJSON_GetObjectItem(item, "messageType") : NULL;
+                cJSON *message_code = message_type ? cJSON_GetObjectItem(message_type, "code") : NULL;
+                if (message_code && cJSON_IsString(message_code) &&
+                    strcmp(message_code->valuestring, "cancel") == 0) continue;
+
+                weather_alert_item_t *out = &result->items[result->count++];
+                cJSON *event_type = cJSON_GetObjectItem(item, "eventType");
+                cJSON *value = event_type ? cJSON_GetObjectItem(event_type, "name") : NULL;
+                if (value && cJSON_IsString(value)) strlcpy(out->event, value->valuestring, sizeof(out->event));
+                value = cJSON_GetObjectItem(item, "headline");
+                if (value && cJSON_IsString(value)) strlcpy(out->headline, value->valuestring, sizeof(out->headline));
+                value = cJSON_GetObjectItem(item, "severity");
+                if (value && cJSON_IsString(value)) strlcpy(out->severity, value->valuestring, sizeof(out->severity));
+                cJSON *color = cJSON_GetObjectItem(item, "color");
+                value = color ? cJSON_GetObjectItem(color, "code") : NULL;
+                if (value && cJSON_IsString(value)) strlcpy(out->color, value->valuestring, sizeof(out->color));
+            }
+        }
+
+        // Put the most serious current alert first for the compact home-screen banner.
+        for (int i = 0; i < result->count; ++i) {
+            for (int j = i + 1; j < result->count; ++j) {
+                if (alert_severity_rank(result->items[j].severity) > alert_severity_rank(result->items[i].severity)) {
+                    weather_alert_item_t swap = result->items[i];
+                    result->items[i] = result->items[j];
+                    result->items[j] = swap;
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+    if (!result->available) ESP_LOGW(TAG, "Weather alert API returned an error response");
+    else ESP_LOGI(TAG, "Weather alerts: %d active", result->count);
+    return result;
+}
+
+void weather_alerts_free(weather_alerts_t *alerts)
+{
+    free(alerts);
+}
+
+// 解析和风天气
+static weather_info_t* parse_hefeng(const char *json) {
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return NULL;
+
+    weather_info_t *info = calloc(1, sizeof(weather_info_t));
+    if (!info) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    cJSON *now = cJSON_GetObjectItem(root, "now");
+    if (now) {
+        // 基本天气信息
+        info->weather = strdup(cJSON_GetObjectItem(now, "text")->valuestring);
+        info->temperature = atof(cJSON_GetObjectItem(now, "temp")->valuestring);
+        info->feels_like = atof(cJSON_GetObjectItem(now, "feelsLike")->valuestring);
+        info->humidity = atof(cJSON_GetObjectItem(now, "humidity")->valuestring);
+
+        // 风信息
+        info->wind_dir = strdup(cJSON_GetObjectItem(now, "windDir")->valuestring);
+        info->wind_scale = strdup(cJSON_GetObjectItem(now, "windScale")->valuestring);
+        info->wind_speed = atof(cJSON_GetObjectItem(now, "windSpeed")->valuestring);
+
+        // 其他气象数据
+        info->precip = atof(cJSON_GetObjectItem(now, "precip")->valuestring);
+        info->pressure = atof(cJSON_GetObjectItem(now, "pressure")->valuestring);
+        info->visibility = atof(cJSON_GetObjectItem(now, "vis")->valuestring);
+        info->cloud = atof(cJSON_GetObjectItem(now, "cloud")->valuestring);
+        info->dew_point = atof(cJSON_GetObjectItem(now, "dew")->valuestring);
+
+        // 更新时间
+        info->update_time = strdup(cJSON_GetObjectItem(root, "updateTime")->valuestring);
+    }
+
+    cJSON_Delete(root);
+    return info;
+}
+
+weather_info_t* weather_get(weather_config_t *config) {
+    if (!config) return NULL;
+    location_info_t *location_info = location_from_config(config);
+    if (!location_info) { ESP_LOGE(TAG, "Failed to resolve location"); return NULL; }
+
+    char url[256];
+    weather_info_t *weather_info = NULL;
+    char encoded_city[64] = {0};
+    char *response = NULL;
+    switch(config->type) {
+        case WEATHER_GAODE:
+            if(!config->api_key){
+                ESP_LOGE(TAG, "GAODE API key is not configured");
+                return NULL;
+            }
+            url_encode(encoded_city, location_info->city, sizeof(encoded_city));
+            snprintf(url, sizeof(url), "https://restapi.amap.com/v3/weather/weatherInfo?city=%s&key=%s",
+                    encoded_city, config->api_key);
+            response = weather_http_request(url);
+            if (response) {
+                weather_info = parse_gaode(response);
+                free(response); // 解析完成后释放响应内存
+            }
+            break;
+
+
+        case WEATHER_XINZHI:
+            if(!config->api_key){
+                ESP_LOGE(TAG, "XINZHI API key is not configured");
+                return NULL;
+            }
+            url_encode(encoded_city, location_info->city, sizeof(encoded_city));
+            snprintf(url, sizeof(url), "https://api.seniverse.com/v3/weather/now.json?key=%s&location=%s&language=zh-Hans&unit=c",
+                    config->api_key, encoded_city);
+            response = weather_http_request(url);
+            if (response) {
+                weather_info = parse_xinzhi(response);
+                free(response);
+            }
+            break;
+
+
+        case WEATHER_HEFENG:
+            if (!config->api_host || !config->api_key) {
+                ESP_LOGE(TAG, "HEFENG API host or key is not configured");
+                return NULL;
+            }
+            char *location_id = resolve_hefeng_location_id(config, location_info);
+            if (!location_id) {
+                ESP_LOGE(TAG, "Failed to get location ID for city: %s", location_info->city);
+                location_info_free(location_info);
+                return NULL;
+            }
+
+            snprintf(url, sizeof(url), "https://%s/v7/weather/now?location=%s&key=%s",
+                    config->api_host, location_id, config->api_key);
+            response = weather_http_request(url);
+            if (response) {
+                weather_info = parse_hefeng(response);
+                free(response);
+            }
+
+            free(location_id);
+            break;
+
+        default:
+            break;
+    }
+    if(weather_info!=NULL) {
+        weather_info->location_info = location_info; // 保存位置信息
+    }
+    return weather_info;
+}
+
+void weather_print_info(const weather_info_t *info) {
+    if (!info) return;
+
+    // 天气符号映射
+    const char* weather_icon = "☁️";
+    if (info->weather) {
+        if (strstr(info->weather, "晴")) weather_icon = "☀️";
+        else if (strstr(info->weather, "雨")) weather_icon = "🌧️";
+        else if (strstr(info->weather, "雪")) weather_icon = "❄️";
+        else if (strstr(info->weather, "雷")) weather_icon = "⛈️";
+        else if (strstr(info->weather, "雾")) weather_icon = "🌫️";
+        else if (strstr(info->weather, "风")) weather_icon = "🌬️";
+    }
+
+    printf("\n  🌈 WEATHER REPORT %s\n", weather_icon);
+    printf("%s\n"," _ _ _ _____ _____ _____ _____ _____ _____ ");
+    printf("%s\n","| | | |   __|  _  |_   _|  |  |   __| __  |");
+    printf("%s\n","| | | |   __|     | | | |     |   __|    -|");
+    printf("%s\n","|_____|_____|__|__| |_| |__|__|_____|__|__|\n");
+
+    // 位置信息
+    if (info->location_info) {
+        char city[64] = {0};
+        if (info->location_info->province && info->location_info->city) {
+            snprintf(city, sizeof(city), "%s·%s",
+                    info->location_info->province,
+                    info->location_info->city);
+        } else if (info->location_info->province) {
+            snprintf(city, sizeof(city), "%s",
+                    info->location_info->province);
+        } else if (info->location_info->city) {
+            snprintf(city, sizeof(city), "%s",
+                    info->location_info->city);
+        }
+        printf("📍 位置: %s\n", city);
+    }
+
+    // 预格式化带单位的数据
+    char temp_str[16] = "", feels_str[16] = "", humidity_str[16] = "";
+    char precip_str[16] = "", pressure_str[16] = "", vis_str[16] = "";
+    char cloud_str[16] = "", dew_str[16] = "", wspeed_str[16] = "";
+
+    if (info->temperature != 0.0f) snprintf(temp_str, sizeof(temp_str), "%.1f℃", info->temperature);
+    if (info->feels_like != 0.0f) snprintf(feels_str, sizeof(feels_str), "%.1f℃", info->feels_like);
+    if (info->humidity != 0.0f) snprintf(humidity_str, sizeof(humidity_str), "%.1f%%", info->humidity);
+    if (info->wind_speed != 0.0f) snprintf(wspeed_str, sizeof(wspeed_str), "%.1fkm/h", info->wind_speed);
+    if (info->precip != 0.0f) snprintf(precip_str, sizeof(precip_str), "%.1fmm", info->precip);
+    if (info->pressure != 0.0f) snprintf(pressure_str, sizeof(pressure_str), "%.1fhPa", info->pressure);
+    if (info->visibility != 0.0f) snprintf(vis_str, sizeof(vis_str), "%.1fkm", info->visibility);
+    if (info->cloud != 0.0f) snprintf(cloud_str, sizeof(cloud_str), "%.1f%%", info->cloud);
+    if (info->dew_point != 0.0f) snprintf(dew_str, sizeof(dew_str), "%.1f℃", info->dew_point);
+
+    printf("┌───────────────────────────────────────┐\n");
+    bool is_empty =
+        (!info->weather || strlen(info->weather) == 0) &&
+        info->temperature == 0.0f &&
+        info->feels_like == 0.0f &&
+        info->humidity == 0.0f &&
+        (!info->wind_dir || strlen(info->wind_dir) == 0) &&
+        (!info->wind_scale || strlen(info->wind_scale) == 0) &&
+        info->wind_speed == 0.0f &&
+        info->precip == 0.0f &&
+        info->pressure == 0.0f &&
+        info->visibility == 0.0f &&
+        info->cloud == 0.0f &&
+        info->dew_point == 0.0f;
+
+    if (is_empty)
+    {
+        printf("│ ⚠️ 未获取到有效的天气数据             │\n");
+        goto end;
+    }
+
+    if (info->weather) printf("│ %s  天气: %-29s │\n", weather_icon, info->weather);
+    if (info->temperature != 0.0f) printf("│ 🌡️  温度: %-30s │\n", temp_str);
+    if (info->feels_like != 0.0f) printf("│ 🤒 体感: %-30s │\n", feels_str);
+    if (info->humidity != 0.0f) printf("│ 💧 湿度: %-28s │\n", humidity_str);
+    if (info->wind_dir) printf("│ 🍃 风向: %-31s │\n", info->wind_dir);
+    if (info->wind_scale) printf("│ 💨 风力: %-28s │\n", info->wind_scale);
+    if (info->wind_speed != 0.0f) printf("│ 🌬️  风速: %-28s │\n", wspeed_str);
+    if (info->precip != 0.0f) printf("│ 🌧️  降水: %-28s │\n", precip_str);
+    if (info->pressure != 0.0f) printf("│ ⏲️  气压: %-28s │\n", pressure_str);
+    if (info->visibility != 0.0f) printf("│ 👁️  能见度: %-26s │\n", vis_str);
+    if (info->cloud != 0.0f) printf("│ ☁️  云量: %-28s │\n", cloud_str);
+    if (info->dew_point != 0.0f) printf("│ 💦 露点: %-30s │\n", dew_str);
+
+end:
+        printf("└───────────────────────────────────────┘\n");
+
+    if (info->update_time) printf("\n🕒 更新时间: %s\n", info->update_time);
+    printf("\n");
+}
+
+void location_info_free(location_info_t *location_info) {
+    if (!location_info) return;
+
+    SAFE_FREE(location_info->ip_address);
+    SAFE_FREE(location_info->province);
+    SAFE_FREE(location_info->city);
+    SAFE_FREE(location_info->district);
+    SAFE_FREE(location_info->isp);
+    SAFE_FREE(location_info);
+}
+
+void weather_info_free(weather_info_t *info) {
+    if (!info) return;
+
+    // 释放天气信息
+    SAFE_FREE(info->weather);
+    SAFE_FREE(info->wind_dir);
+    SAFE_FREE(info->wind_scale);
+    SAFE_FREE(info->update_time);
+
+    // 释放位置信息
+    if (info->location_info) {
+        location_info_free(info->location_info);
+    }
+    SAFE_FREE(info);
+}
+
+// ==================== 多日天气预报 ====================
+
+// 取字符串字段（返回NULL表示缺失）
+static const char* json_str(cJSON *obj, const char *key) {
+    cJSON *v = cJSON_GetObjectItem(obj, key);
+    return (v && cJSON_IsString(v) && v->valuestring) ? v->valuestring : NULL;
+}
+
+// 取数值字段（和风API数字字段是字符串类型）
+static float json_num(cJSON *obj, const char *key) {
+    cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v) return 0.0f;
+    if (cJSON_IsString(v) && v->valuestring) return atof(v->valuestring);
+    if (cJSON_IsNumber(v)) return (float)v->valuedouble;
+    return 0.0f;
+}
+
+// 由日期字符串 (2026-10-19) 计算星期（蔡勒公式，不依赖系统时间）
+static const char* forecast_weekday(const char *fx_date) {
+    int y = 0, m = 0, d = 0;
+    if (!fx_date || sscanf(fx_date, "%d-%d-%d", &y, &m, &d) != 3) return "";
+    if (m < 3) { m += 12; y -= 1; }
+    int k = y % 100;
+    int j = y / 100;
+    int h = (d + 13 * (m + 1) / 5 + k + k / 4 + j / 4 + 5 * j) % 7; // 0=周六
+    static const char *names[] = {"周六", "周日", "周一", "周二", "周三", "周四", "周五"};
+    return names[h % 7];
+}
+
+// 解析和风 /v7/weather/7d 响应
+static weather_forecast_t* parse_hefeng_forecast(const char *json, int days) {
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return NULL;
+
+    cJSON *code = cJSON_GetObjectItem(root, "code");
+    if (!code || !cJSON_IsString(code) || strcmp(code->valuestring, "200") != 0) {
+        ESP_LOGE(TAG, "Forecast API error, code=%s",
+                 (code && cJSON_IsString(code)) ? code->valuestring : "?");
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    weather_forecast_t *forecast = calloc(1, sizeof(weather_forecast_t));
+    if (!forecast) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    const char *update = json_str(root, "updateTime");
+    if (update) forecast->update_time = strdup(update);
+
+    cJSON *daily = cJSON_GetObjectItem(root, "daily");
+    if (daily && cJSON_IsArray(daily)) {
+        int n = cJSON_GetArraySize(daily);
+        if (n > days) n = days;
+        if (n > WEATHER_FORECAST_MAX_DAYS) n = WEATHER_FORECAST_MAX_DAYS;
+
+        for (int i = 0; i < n; i++) {
+            cJSON *item = cJSON_GetArrayItem(daily, i);
+            if (!item) continue;
+            weather_daily_t *d = &forecast->daily[i];
+
+            const char *s;
+            if ((s = json_str(item, "fxDate")))     d->fx_date = strdup(s);
+            if ((s = json_str(item, "textDay")))     d->text_day = strdup(s);
+            if ((s = json_str(item, "textNight")))   d->text_night = strdup(s);
+            if ((s = json_str(item, "windDirDay")))  d->wind_dir_day = strdup(s);
+            if ((s = json_str(item, "windScaleDay")))d->wind_scale_day = strdup(s);
+            if ((s = json_str(item, "sunrise")))     d->sunrise = strdup(s);
+            if ((s = json_str(item, "sunset")))      d->sunset = strdup(s);
+            if ((s = json_str(item, "sunrise")))     d->sunrise = strdup(s);
+            if ((s = json_str(item, "sunset")))      d->sunset = strdup(s);
+
+            d->temp_max  = json_num(item, "tempMax");
+            d->temp_min  = json_num(item, "tempMin");
+            d->humidity  = json_num(item, "humidity");
+            d->precip    = json_num(item, "precip");
+            d->uv_index  = json_num(item, "uvIndex");
+        }
+        forecast->day_count = n;
+    }
+
+    cJSON_Delete(root);
+    return forecast;
+}
+
+weather_forecast_t* weather_get_forecast(weather_config_t *config, int days) {
+    if (!config || config->type != WEATHER_HEFENG) {
+        ESP_LOGE(TAG, "Forecast currently supports HEFENG only");
+        return NULL;
+    }
+    if (!config->api_host || !config->api_key) {
+        ESP_LOGE(TAG, "HEFENG API host or key is not configured");
+        return NULL;
+    }
+    if (days < 1) days = 1;
+    if (days > WEATHER_FORECAST_MAX_DAYS) days = WEATHER_FORECAST_MAX_DAYS;
+
+    location_info_t *location_info = location_from_config(config);
+    if (!location_info) return NULL;
+
+    char *location_id = resolve_hefeng_location_id(config, location_info);
+    if (!location_id) {
+        ESP_LOGE(TAG, "Failed to get location ID for city: %s", location_info->city);
+        location_info_free(location_info);
+        return NULL;
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s/v7/weather/7d?location=%s&key=%s",
+            config->api_host, location_id, config->api_key);
+    free(location_id);
+
+    char *response = weather_http_request(url);
+    if (!response) {
+        location_info_free(location_info);
+        return NULL;
+    }
+
+    weather_forecast_t *forecast = parse_hefeng_forecast(response, days);
+    free(response);
+
+    if (!forecast) {
+        location_info_free(location_info);
+        return NULL;
+    }
+    forecast->location_info = location_info;
+    return forecast;
+}
+
+// 天气现象 -> 图标
+static const char* weather_icon_of(const char *text) {
+    if (!text) return "☁️";
+    if (strstr(text, "晴")) return "☀️";
+    if (strstr(text, "雨")) return "🌧️";
+    if (strstr(text, "雪")) return "❄️";
+    if (strstr(text, "雷")) return "⛈️";
+    if (strstr(text, "雾")) return "🌫️";
+    if (strstr(text, "风")) return "🌬️";
+    return "☁️";
+}
+
+void weather_print_forecast(const weather_forecast_t *forecast) {
+    if (!forecast || forecast->day_count <= 0) return;
+
+    if (forecast->location_info) {
+        char city[64] = {0};
+        if (forecast->location_info->province && forecast->location_info->city) {
+            snprintf(city, sizeof(city), "%s·%s",
+                    forecast->location_info->province, forecast->location_info->city);
+        } else if (forecast->location_info->city) {
+            snprintf(city, sizeof(city), "%s", forecast->location_info->city);
+        }
+        printf("\n  📅 未来 %d 天预报（%s）\n", forecast->day_count, city);
+    } else {
+        printf("\n  📅 未来 %d 天预报\n", forecast->day_count);
+    }
+
+    printf("  ─────────────────────────────────────────────\n");
+
+    for (int i = 0; i < forecast->day_count; i++) {
+        const weather_daily_t *d = &forecast->daily[i];
+
+        // 日期只显示 月-日
+        char date_short[6] = {0};
+        if (d->fx_date && strlen(d->fx_date) >= 10) {
+            snprintf(date_short, sizeof(date_short), "%s", d->fx_date + 5); // MM-DD
+        }
+
+        char temp_str[20] = {0};
+        snprintf(temp_str, sizeof(temp_str), "%.0f~%.0f℃", d->temp_min, d->temp_max);
+
+        char wind_str[32] = {0};
+        if (d->wind_dir_day && d->wind_scale_day) {
+            snprintf(wind_str, sizeof(wind_str), "%s %s级", d->wind_dir_day, d->wind_scale_day);
+        } else if (d->wind_dir_day) {
+            snprintf(wind_str, sizeof(wind_str), "%s", d->wind_dir_day);
+        }
+
+        printf("  %s %s %s  %s → %s   %-10s  %s\n",
+               weather_icon_of(d->text_day),
+               date_short,
+               forecast_weekday(d->fx_date),
+               d->text_day ? d->text_day : "-",
+               d->text_night ? d->text_night : "-",
+               temp_str,
+               wind_str);
+    }
+
+    printf("  ─────────────────────────────────────────────\n");
+    if (forecast->update_time) printf("  🕒 预报更新: %s\n", forecast->update_time);
+    printf("\n");
+}
+
+void weather_forecast_free(weather_forecast_t *forecast) {
+    if (!forecast) return;
+
+    SAFE_FREE(forecast->update_time);
+    for (int i = 0; i < WEATHER_FORECAST_MAX_DAYS; i++) {
+        SAFE_FREE(forecast->daily[i].fx_date);
+        SAFE_FREE(forecast->daily[i].text_day);
+        SAFE_FREE(forecast->daily[i].text_night);
+        SAFE_FREE(forecast->daily[i].wind_dir_day);
+        SAFE_FREE(forecast->daily[i].wind_scale_day);
+        SAFE_FREE(forecast->daily[i].sunrise);
+        SAFE_FREE(forecast->daily[i].sunset);
+        SAFE_FREE(forecast->daily[i].sunrise);
+        SAFE_FREE(forecast->daily[i].sunset);
+    }
+    if (forecast->location_info) {
+        location_info_free(forecast->location_info);
+    }
+    SAFE_FREE(forecast);
+}
+
+// ==================== 逐小时预报（/v7/weather/24h） ====================
+
+// 解析和风 /v7/weather/24h 响应
+static weather_hourly_forecast_t* parse_hefeng_hourly(const char *json, int hours) {
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return NULL;
+
+    cJSON *code = cJSON_GetObjectItem(root, "code");
+    if (!code || !cJSON_IsString(code) || strcmp(code->valuestring, "200") != 0) {
+        ESP_LOGE(TAG, "Hourly API error, code=%s",
+                 (code && cJSON_IsString(code)) ? code->valuestring : "?");
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    weather_hourly_forecast_t *hourly = calloc(1, sizeof(weather_hourly_forecast_t));
+    if (!hourly) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+
+    const char *update = json_str(root, "updateTime");
+    if (update) hourly->update_time = strdup(update);
+
+    cJSON *arr = cJSON_GetObjectItem(root, "hourly");
+    if (arr && cJSON_IsArray(arr)) {
+        int n = cJSON_GetArraySize(arr);
+        if (n > hours) n = hours;
+        if (n > WEATHER_HOURLY_MAX_HOURS) n = WEATHER_HOURLY_MAX_HOURS;
+
+        for (int i = 0; i < n; i++) {
+            cJSON *item = cJSON_GetArrayItem(arr, i);
+            if (!item) continue;
+            weather_hourly_t *h = &hourly->hourly[i];
+
+            const char *s;
+            if ((s = json_str(item, "fxTime"))) h->fx_time = strdup(s);
+            if ((s = json_str(item, "text")))   h->text = strdup(s);
+
+            h->temp = json_num(item, "temp");
+            h->pop  = json_num(item, "pop");
+        }
+        hourly->hour_count = n;
+    }
+
+    cJSON_Delete(root);
+    return hourly;
+}
+
+weather_hourly_forecast_t* weather_get_hourly(weather_config_t *config, int hours) {
+    if (!config || config->type != WEATHER_HEFENG) {
+        ESP_LOGE(TAG, "Hourly currently supports HEFENG only");
+        return NULL;
+    }
+    if (!config->api_host || !config->api_key) {
+        ESP_LOGE(TAG, "HEFENG API host or key is not configured");
+        return NULL;
+    }
+    if (hours < 1) hours = 1;
+    if (hours > WEATHER_HOURLY_MAX_HOURS) hours = WEATHER_HOURLY_MAX_HOURS;
+
+    location_info_t *location_info = location_from_config(config);
+    if (!location_info) return NULL;
+
+    char *location_id = resolve_hefeng_location_id(config, location_info);
+    if (!location_id) {
+        ESP_LOGE(TAG, "Failed to get location ID for city: %s", location_info->city);
+        location_info_free(location_info);
+        return NULL;
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s/v7/weather/24h?location=%s&key=%s",
+            config->api_host, location_id, config->api_key);
+    free(location_id);
+
+    char *response = weather_http_request(url);
+    if (!response) {
+        location_info_free(location_info);
+        return NULL;
+    }
+
+    weather_hourly_forecast_t *hourly = parse_hefeng_hourly(response, hours);
+    free(response);
+
+    if (!hourly) {
+        location_info_free(location_info);
+        return NULL;
+    }
+    hourly->location_info = location_info;
+    return hourly;
+}
+
+void weather_print_hourly(const weather_hourly_forecast_t *hourly) {
+    if (!hourly || hourly->hour_count <= 0) return;
+    printf("\n  🕐 未来 %d 小时预报\n", hourly->hour_count);
+    printf("  ─────────────────────────────────────────────\n");
+    for (int i = 0; i < hourly->hour_count; i++) {
+        const weather_hourly_t *h = &hourly->hourly[i];
+        char hhmm[6] = {0};
+        if (h->fx_time && strlen(h->fx_time) >= 16) {
+            snprintf(hhmm, sizeof(hhmm), "%s", h->fx_time + 11); // HH:MM
+        }
+        printf("  %s  %-6s  %.0f℃  降水概率 %.0f%%\n",
+               hhmm, h->text ? h->text : "-", h->temp, h->pop);
+    }
+    printf("  ─────────────────────────────────────────────\n");
+}
+
+void weather_hourly_free(weather_hourly_forecast_t *hourly) {
+    if (!hourly) return;
+    SAFE_FREE(hourly->update_time);
+    for (int i = 0; i < WEATHER_HOURLY_MAX_HOURS; i++) {
+        SAFE_FREE(hourly->hourly[i].fx_time);
+        SAFE_FREE(hourly->hourly[i].text);
+    }
+    if (hourly->location_info) {
+        location_info_free(hourly->location_info);
+    }
+    SAFE_FREE(hourly);
+}
