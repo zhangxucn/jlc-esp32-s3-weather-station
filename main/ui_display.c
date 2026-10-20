@@ -425,4 +425,388 @@ static void draw_glyph_coverage(int x, int y, const uint8_t *bmp, int sw, int sh
             int ink = 0, area = (sy1 - sy0) * (sx1 - sx0);
             for (int sy = sy0; sy < sy1; ++sy) {
                 for (int sx = sx0; sx < sx1; ++sx) {
-                    if (bmp[sy * pitch + (s
+                    if (bmp[sy * pitch + (sx >> 3)] & (0x80 >> (sx & 7))) ++ink;
+                }
+            }
+            if (!ink) continue;
+            int alpha = (ink * 255 + area / 2) / area;
+            if (alpha < 88) alpha = 88;
+            int px = x + ox, py = y + oy;
+            if (px >= 0 && py >= 0 && px < LCD_H_RES && py < LCD_V_RES) {
+                uint16_t *dst = &s_fb[py * LCD_H_RES + px];
+                *dst = blend565(*dst, color, alpha);
+            }
+        }
+    }
+}
+
+int lcd_draw_text(int x, int y, const char *utf8, uint16_t color, int scale)
+{
+    if (!utf8 || scale < 1) return 0;
+    int x0 = x;
+    const char *s = utf8;
+    while (*s) {
+        uint32_t cp = utf8_next(&s);
+        if (cp == '\n') { y += 16 * scale; x = x0; continue; }
+        const uint8_t *g = font_ascii16_get(cp);
+        if (g) {
+            draw_glyph(x, y, g, 12, 16, 2, color, scale);   // ASCII 12px 宽，2字节/行
+            x += 12 * scale;
+            continue;
+        }
+        g = font_cjk16_get(cp);
+        if (g) {
+            draw_glyph(x, y, g, 16, 16, 2, color, scale);
+            x += 16 * scale;
+        } else {
+            lcd_fill_rect(x + 2, y + 2, 12 * scale, 12 * scale, C_HINT); // 缺字占位
+            x += 16 * scale;
+        }
+    }
+    return x - x0;
+}
+
+int lcd_text_width(const char *utf8, int scale)
+{
+    if (!utf8) return 0;
+    int w = 0;
+    const char *s = utf8;
+    while (*s) {
+        uint32_t cp = utf8_next(&s);
+        if (cp == '\n') break;
+        w += (cp < 0x80) ? 12 * scale : 16 * scale;
+    }
+    return w;
+}
+
+int lcd_draw_text_compact(int x, int y, const char *ascii, uint16_t color)
+{
+    if (!ascii) return 0;
+    int x0 = x;
+    for (const unsigned char *s = (const unsigned char *)ascii; *s; s++) {
+        const uint8_t *bmp = font_ascii16_get(*s);
+        if (!bmp) { x += 8; continue; }
+        // 12x16 字形按覆盖采样缩至 8x12，细笔画不会因简单隔点而丢失。
+        for (int oy = 0; oy < 12; oy++) {
+            int sy0 = oy * 16 / 12;
+            int sy1 = (oy + 1) * 16 / 12;
+            for (int ox = 0; ox < 8; ox++) {
+                int sx0 = ox * 12 / 8;
+                int sx1 = (ox + 1) * 12 / 8;
+                bool ink = false;
+                for (int sy = sy0; sy < sy1 && !ink; sy++) {
+                    for (int sx = sx0; sx < sx1; sx++) {
+                        if (bmp[sy * 2 + (sx >> 3)] & (0x80 >> (sx & 7))) {
+                            ink = true;
+                            break;
+                        }
+                    }
+                }
+                if (ink) lcd_draw_pixel(x + ox, y + oy, color);
+            }
+        }
+        x += 8;
+    }
+    return x - x0;
+}
+
+int lcd_draw_text_small(int x, int y, const char *utf8, uint16_t color)
+{
+    if (!utf8) return 0;
+    int x0 = x;
+    const char *s = utf8;
+    while (*s) {
+        uint32_t cp = utf8_next(&s);
+        if (cp == '\n') break;
+        const uint8_t *bmp = font_ascii16_get(cp);
+        int sw = 12, sh = 16, dw = 8, dh = 12;
+        if (!bmp) {
+            bmp = font_cjk16_get(cp);
+            sw = sh = 16; dw = dh = 12;
+        }
+        if (!bmp) { x += dw; continue; }
+        for (int oy = 0; oy < dh; ++oy) {
+            int sy0 = oy * sh / dh, sy1 = (oy + 1) * sh / dh;
+            for (int ox = 0; ox < dw; ++ox) {
+                int sx0 = ox * sw / dw, sx1 = (ox + 1) * sw / dw;
+                int ink = 0, area = (sy1 - sy0) * (sx1 - sx0);
+                for (int sy = sy0; sy < sy1; ++sy)
+                    for (int sx = sx0; sx < sx1; ++sx)
+                        if (bmp[sy * 2 + (sx >> 3)] & (0x80 >> (sx & 7))) ++ink;
+                if (ink && x + ox >= 0 && x + ox < LCD_H_RES && y + oy >= 0 && y + oy < LCD_V_RES) {
+                    int alpha = (ink * 255 + area / 2) / area;
+                    if (alpha < 88) alpha = 88;
+                    uint16_t *dst = &s_fb[(y + oy) * LCD_H_RES + x + ox];
+                    *dst = blend565(*dst, color, alpha);
+                }
+            }
+        }
+        x += dw;
+    }
+    return x - x0;
+}
+
+// 墨迹宽度/左边界扫描（大数字比例字距用）
+static int glyph_ink(const uint8_t *bmp, int w, int h, int pitch, int *out_left)
+{
+    int minb = w, maxb = -1;
+    for (int i = 0; i < w; i++) {
+        bool on = false;
+        for (int j = 0; j < h; j++) {
+            if (bmp[j * pitch + (i >> 3)] & (0x80 >> (i & 7))) { on = true; break; }
+        }
+        if (on) { if (i < minb) minb = i; if (i > maxb) maxb = i; }
+    }
+    if (maxb < 0) { *out_left = 0; return w / 2; }
+    *out_left = minb;
+    return maxb - minb + 1;
+}
+
+#define BIG_TRACK   6      // 大数字字距
+#define BIG_SPACE   18     // 空格宽
+
+int lcd_big_text_width(const char *utf8)
+{
+    if (!utf8) return 0;
+    int w = 0;
+    const char *s = utf8;
+    while (*s) {
+        uint32_t cp = utf8_next(&s);
+        if (cp == ' ') { w += BIG_SPACE; continue; }
+        const uint8_t *g = font_big48_get(cp);
+        if (g) {
+            int left, ink = glyph_ink(g, 48, 48, 6, &left);
+            w += ink + BIG_TRACK;
+        } else {
+            w += (cp < 0x80) ? 16 : 32;   // 退化 2x 小字
+        }
+    }
+    return w > 0 ? w - BIG_TRACK : 0;     // 末字不留字距
+}
+
+int lcd_draw_big(int x, int y, const char *utf8, uint16_t color)
+{
+    if (!utf8) return 0;
+    int x0 = x;
+    const char *s = utf8;
+    while (*s) {
+        uint32_t cp = utf8_next(&s);
+        if (cp == ' ') { x += BIG_SPACE; continue; }
+        const uint8_t *g = font_big48_get(cp);
+        if (g) {
+            int left, ink = glyph_ink(g, 48, 48, 6, &left);
+            draw_glyph(x - left, y, g, 48, 48, 6, color, 1);   // 墨迹左对齐
+            x += ink + BIG_TRACK;
+        } else {
+            // 大字库里没有的字符，退化用 2x 小字
+            const uint8_t *g2 = font_ascii16_get(cp);
+            if (g2) {
+                draw_glyph(x, y + 16, g2, 12, 16, 2, color, 2);
+                x += 24;
+            } else {
+                const uint8_t *g3 = font_cjk16_get(cp);
+                if (g3) {
+                    draw_glyph(x, y + 8, g3, 16, 16, 2, color, 2);
+                    x += 32;
+                }
+            }
+        }
+    }
+    return x - x0;
+}
+
+int lcd_draw_big_smooth(int x, int y, const char *utf8, uint16_t color)
+{
+    if (!utf8) return 0;
+    const int size = 44;
+    int x0 = x;
+    const char *s = utf8;
+    while (*s) {
+        uint32_t cp = utf8_next(&s);
+        if (cp == ' ') { x += BIG_SPACE * size / 48; continue; }
+        const uint8_t *g = font_big48_get(cp);
+        if (g) {
+            int left, ink = glyph_ink(g, 48, 48, 6, &left);
+            int scaled_left = left * size / 48;
+            int scaled_ink = (ink * size + 47) / 48;
+            draw_glyph_coverage(x - scaled_left, y, g, 48, 48, 6, size, size, color);
+            x += scaled_ink + BIG_TRACK * size / 48;
+        } else {
+            const uint8_t *g2 = font_ascii16_get(cp);
+            if (g2) {
+                draw_glyph(x, y + 8, g2, 12, 16, 2, color, 2);
+                x += 24;
+            } else {
+                const uint8_t *g3 = font_cjk16_get(cp);
+                if (g3) {
+                    draw_glyph(x, y + 4, g3, 16, 16, 2, color, 2);
+                    x += 32;
+                }
+            }
+        }
+    }
+    return x - x0;
+}
+
+int lcd_draw_shadow_text(int x, int y, const char *utf8, uint16_t color, int scale)
+{
+    lcd_draw_text(x + 1, y + 1, utf8, C_SHADOW, scale);
+    return lcd_draw_text(x, y, utf8, color, scale);
+}
+
+// ================= 天气图标（矢量、仿主流天气 App，尺寸自适应细节） =================
+// 太阳：外光晕 + 长短交替光芒 + 本体 + 左上高光（小尺寸减芒、去光晕防糊）
+static void icon_sun(int cx, int cy, int s)
+{
+    int r = s / 5;
+    if (r < 3) r = 3;
+    if (s >= 24) lcd_blend_circle(cx, cy, r + s / 5, RGB(0xFF, 0xC8, 0x5C), 42);   // 暖光晕
+    int rays = (s >= 24) ? 12 : 8;
+    for (int a = 0; a < rays; a++) {
+        float rad = a * 3.14159265f / (rays / 2);
+        int len = (s >= 24) ? ((a % 2 == 0) ? (r + s / 6) : (r + s / 10)) : (r + s / 7);
+        int x0 = cx + (int)(cosf(rad) * (r + 1));
+        int y0 = cy + (int)(sinf(rad) * (r + 1));
+        int x1 = cx + (int)(cosf(rad) * len);
+        int y1 = cy + (int)(sinf(rad) * len);
+        lcd_draw_line(x0, y0, x1, y1, C_SUN_RAY);
+        if (s >= 24) lcd_draw_line(x0 + 1, y0, x1 + 1, y1, C_SUN_RAY);             // 加粗
+    }
+    lcd_fill_circle(cx, cy, r, C_SUN);
+    if (s >= 20) lcd_fill_circle(cx - r / 3, cy - r / 3, r / 2, C_SUN_HI);          // 高光
+}
+
+// 月亮：冷光晕 + 月牙（挖空）+ 环形山 + 小星
+static void icon_moon(int cx, int cy, int s, uint16_t bg)
+{
+    int r = s / 3;
+    if (r < 3) r = 3;
+    lcd_blend_circle(cx, cy, r + s / 6, RGB(0xFF, 0xF3, 0xC4), 32);     // 冷光晕
+    lcd_fill_circle(cx, cy, r, RGB(0xFF, 0xF3, 0xC4));
+    lcd_fill_circle(cx - r / 4, cy - r / 4, r / 3, RGB(0xFF, 0xFB, 0xEA));  // 亮面
+    lcd_fill_circle(cx + r / 3, cy + r / 5, r / 6, RGB(0xE8, 0xDC, 0xB8));  // 暗斑
+    lcd_fill_circle(cx + r / 2, cy - r / 3, r - 1, bg);                    // 挖月牙
+    // 两颗小星
+    lcd_draw_pixel(cx + r + s / 8, cy - r - s / 10, RGB(0xFF, 0xFF, 0xFF));
+    lcd_draw_pixel(cx + r + s / 8 + 1, cy - r - s / 10 + 1, RGB(0xFF, 0xFF, 0xFF));
+    lcd_draw_pixel(cx + r + s / 6, cy - r + s / 10, RGB(0xE8, 0xEE, 0xF7));
+}
+
+// 云朵主体：大尺寸双层体积感（阴影层下移 + 亮层）；小尺寸简化单团防糊
+static void icon_cloud(int cx, int cy, int s, uint16_t main, uint16_t shade)
+{
+    int r  = s / 5 + 1;      // 侧圆半径
+    int rm = s / 4 + 1;      // 顶圆半径
+    if (r < 2) r = 2;
+    if (rm < 3) rm = 3;
+
+    if (s < 20) {
+        // 小尺寸：两个圆 + 底条的一团云，干净利落
+        int rr = s / 3 + 1;
+        lcd_fill_circle(cx - s / 6, cy + s / 12, rr, main);
+        lcd_fill_circle(cx + s / 6, cy + s / 12, rr, main);
+        lcd_fill_rect(cx - s / 6, cy + s / 12, s / 3 + 1, rr, main);
+        lcd_fill_rect(cx - s / 6, cy + s / 12 + rr - 1, s / 3 + 1, 1, shade);
+        return;
+    }
+    // 阴影层（整体下移 2px，深色）
+    lcd_fill_circle(cx - s / 4, cy + s / 12 + 2, r, shade);
+    lcd_fill_circle(cx + s / 12, cy - s / 8 + 2, rm, shade);
+    lcd_fill_circle(cx + s / 4, cy + s / 10 + 2, r - 1, shade);
+    lcd_fill_rect(cx - s / 4, cy + s / 12 + 2, s / 2 + s / 8, r, shade);
+    // 主体层
+    lcd_fill_circle(cx - s / 4, cy + s / 12, r, main);
+    lcd_fill_circle(cx + s / 12, cy - s / 8, rm, main);
+    lcd_fill_circle(cx + s / 4, cy + s / 10, r - 1, main);
+    lcd_fill_rect(cx - s / 4, cy + s / 12, s / 2 + s / 8, r, main);
+}
+
+// 雨：云 + 圆头水滴（圆点头部 + 斜向细尾）
+static void icon_rain(int cx, int cy, int s)
+{
+    icon_cloud(cx, cy - s / 8, s, C_CLOUD, C_CLOUD_SH);
+    for (int i = -1; i <= 1; i++) {
+        int dx = cx + i * s / 4;
+        int dy = cy + s / 5;
+        lcd_draw_line(dx, dy, dx - s / 14, dy + s / 4, C_RAIN);         // 尾
+        if (s >= 20) lcd_draw_line(dx + 1, dy, dx - s / 14 + 1, dy + s / 4, C_RAIN);
+        lcd_fill_circle(dx, dy, (s >= 20) ? (2 + s / 48) : 1, C_RAIN);  // 圆头
+    }
+}
+
+// 雪：云 + 六角雪花（三轴交叉）
+static void icon_snow(int cx, int cy, int s)
+{
+    icon_cloud(cx, cy - s / 8, s, C_CLOUD, C_CLOUD_SH);
+    for (int i = -1; i <= 1; i++) {
+        int sx = cx + i * s / 4;
+        int sy = cy + s / 4;
+        int rr = 2 + s / 24;
+        if (s < 20) {                                                   // 小尺寸：单点雪花
+            lcd_draw_pixel(sx, sy, C_SNOW);
+            continue;
+        }
+        lcd_draw_line(sx - rr, sy, sx + rr, sy, C_SNOW);                // 横轴
+        lcd_draw_line(sx - rr / 2, sy - rr, sx + rr / 2, sy + rr, C_SNOW);   // 斜轴 1
+        lcd_draw_line(sx - rr / 2, sy + rr, sx + rr / 2, sy - rr, C_SNOW);   // 斜轴 2
+    }
+}
+
+// 雷：深灰云 + 加粗锯齿闪电
+static void icon_thunder(int cx, int cy, int s)
+{
+    icon_cloud(cx, cy - s / 8, s, RGB(0x9E, 0xAE, 0xBE), RGB(0x76, 0x86, 0x98));
+    int bx = cx - s / 24, by = cy + s / 8;
+    int pts[6][2] = {
+        { 0, 0 }, { -s / 8, s / 5 }, { 0, s / 5 },
+        { -s / 7, s / 2 }, { -s / 20, s / 2 }, { -s / 6, s * 2 / 3 },
+    };
+    for (int i = 0; i < 5; i++) {
+        lcd_draw_line(bx + pts[i][0], by + pts[i][1], bx + pts[i + 1][0], by + pts[i + 1][1], C_THUNDER);
+        lcd_draw_line(bx + pts[i][0] + 1, by + pts[i][1], bx + pts[i + 1][0] + 1, by + pts[i + 1][ 1], C_THUNDER);
+    }
+}
+
+// 雾：圆头横线，长短交错（小尺寸减为 3 条防糊）
+static void icon_fog(int cx, int cy, int s)
+{
+    int lines = (s < 20) ? 3 : 4;
+    for (int i = 0; i < lines; i++) {
+        int ly = cy - s / 3 + i * (s / (lines - 1 > 0 ? lines - 1 : 1)) * 3 / 2;
+        int lw = s / 2 - (i % 2 == 0 ? 0 : s / 10);
+        int lx = cx - lw / 2;
+        uint16_t c = (i % 2 == 0) ? C_FOG : RGB(0xC4, 0xD0, 0xDC);
+        int th = 2 + s / 32;
+        lcd_fill_rect(lx, ly, lw, th, c);
+        lcd_fill_circle(lx, ly + th / 2, th / 2 + 1, c);                 // 左圆头
+        lcd_fill_circle(lx + lw, ly + th / 2, th / 2 + 1, c);            // 右圆头
+    }
+}
+
+// 风：双线流风，尾部上翘
+static void icon_wind(int cx, int cy, int s)
+{
+    for (int i = -1; i <= 1; i++) {
+        int y = cy + i * s / 5;
+        int x0 = cx - s / 3, x1 = cx + s / 6;
+        lcd_draw_line(x0, y, x1, y, C_CLOUD);
+        lcd_draw_line(x0, y + 1, x1, y + 1, C_CLOUD);
+        lcd_draw_line(x1, y, x1 + s / 12, y - s / 12, C_CLOUD);          // 上翘勾
+        lcd_draw_line(x1, y + 1, x1 + s / 12, y - s / 12 + 1, C_CLOUD);
+    }
+}
+
+void lcd_draw_weather_icon(int cx, int cy, int size, const char *text, bool night, uint16_t bg)
+{
+    if (!text) { icon_cloud(cx, cy, size, C_CLOUD, C_CLOUD_SH); return; }
+    if (strstr(text, "晴")) {
+        if (night) icon_moon(cx, cy, size, bg);
+        else icon_sun(cx, cy, size);
+    } else if (strstr(text, "雷")) icon_thunder(cx, cy, size);
+    else if (strstr(text, "雪") || strstr(text, "冰")) icon_snow(cx, cy, size);
+    else if (strstr(text, "雨") || strstr(text, "霖")) icon_rain(cx, cy, size);
+    else if (strstr(text, "雾") || strstr(text, "霾") || strstr(text, "沙") || strstr(text, "尘")) icon_fog(cx, cy, size);
+    else if (strstr(text, "风")) icon_wind(cx, cy, size);
+    else if (strstr(text, "阴")) icon_cloud(cx, cy, size, C_CLOUD_SH, RGB(0x96, 0xA6, 0xB8));   // 阴天更灰
+    else icon_cloud(cx, cy, size, C_CLOUD, C_CLOUD_SH);
+}

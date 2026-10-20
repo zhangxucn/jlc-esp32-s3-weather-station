@@ -404,4 +404,686 @@ void ui_render_today(const weather_info_t *now, const weather_forecast_t *fc,
         lcd_draw_text(weather_x, 66, weather_label, C_WHITE, 1);
     }
     if (active_alert) {
-        const char *event = active_alert->even
+        const char *event = active_alert->event[0] ? active_alert->event : "恶劣天气";
+        fit_small_text_width(metric_line, sizeof(metric_line), event,
+                             metrics_x - weather_x - 8);
+        lcd_draw_text_small(weather_x, 84, metric_line, alert_badge_color(active_alert));
+    }
+
+    // Compact live conditions sit to the right of the weather label, stacked
+    // in a 92px column that ends before the hero icon begins.
+    snprintf(metric_raw, sizeof(metric_raw), "湿度 %.0f%%", now->humidity);
+    fit_small_text_width(metric_line, sizeof(metric_line), metric_raw, 92);
+    lcd_draw_text_small(metrics_x, 50, metric_line, C_WHITE2);
+
+    if (now->wind_dir && now->wind_dir[0])
+        snprintf(metric_raw, sizeof(metric_raw), "%s %.0fkm/h", now->wind_dir, now->wind_speed);
+    else
+        snprintf(metric_raw, sizeof(metric_raw), "风速 %.0fkm/h", now->wind_speed);
+    fit_small_text_width(metric_line, sizeof(metric_line), metric_raw, 92);
+    lcd_draw_text_small(metrics_x, 64, metric_line, C_WHITE2);
+
+    if (air_quality && air_quality->available) {
+        snprintf(metric_raw, sizeof(metric_raw), "AQI %s %s",
+                 air_quality->aqi[0] ? air_quality->aqi : "--",
+                 air_quality->category[0] ? air_quality->category : "");
+        fit_small_text_width(metric_line, sizeof(metric_line), metric_raw, 92);
+        lcd_draw_text_small(metrics_x, 78, metric_line, air_quality_color(air_quality->category));
+    } else {
+        lcd_draw_text_small(metrics_x, 78, "AQI --", C_WHITE2);
+    }
+    snprintf(metric_raw, sizeof(metric_raw), "气压 %.0fhPa", now->pressure);
+    fit_small_text_width(metric_line, sizeof(metric_line), metric_raw, 92);
+    lcd_draw_text_small(metrics_x, 92, metric_line, C_WHITE2);
+    lcd_draw_weather_icon(270, 77, 52, now->weather, night, mid);
+
+    // High/low and feels-like temperature stay readable under the hero temperature.
+    float t_max = (fc && fc->day_count > 0) ? fc->daily[0].temp_max : 20;
+    float t_min = (fc && fc->day_count > 0) ? fc->daily[0].temp_min : 10;
+    int x = 14;
+    x += draw_arrow_up(x, 111, RGB(0xFF,0xD7,0x7A));
+    {
+        char tmax[12];
+        fmt_temp(tmax, sizeof(tmax), t_max);
+        x += lcd_draw_text(x, 103, tmax, C_WHITE, 1);
+    }
+    x += lcd_draw_text(x + 2, 90, " · ", C_WHITE2, 1);
+    x += draw_arrow_down(x, 111, RGB(0x82,0xD7,0xFF));
+    {
+        char tmin[12];
+        fmt_temp(tmin, sizeof(tmin), t_min);
+        x += lcd_draw_text(x, 103, tmin, C_WHITE, 1);
+    }
+    {
+        char feels[32];
+        char ft[12];
+        fmt_temp(ft, sizeof(ft), now->feels_like);
+        snprintf(feels, sizeof(feels), "体感 %s", ft);
+        lcd_draw_text_small(168, 104, feels, C_WHITE2);
+    }
+
+    // 12-hour curve fills the space freed by the removed today/tomorrow rows.
+    const int hy0 = 118, hx = 8, hw = 304, hh = 108;
+    lcd_blend_round_rect(hx, hy0, hw, hh, 13, RGB(0x14,0x3E,0x62), 225);
+
+    if (!hy || hy->hour_count <= 0) {
+        int w = lcd_text_width("暂无小时预报", 1);
+        lcd_draw_text(hx + (hw - w) / 2, hy0 + 37, "暂无小时预报", C_WHITE2, 1);
+    } else {
+        int n = hy->hour_count < 12 ? hy->hour_count : 12;
+        float tmin = 1e9f, tmax = -1e9f;
+        for (int i = 0; i < n; i++) {
+            if (hy->hourly[i].temp < tmin) tmin = hy->hourly[i].temp;
+            if (hy->hourly[i].temp > tmax) tmax = hy->hourly[i].temp;
+        }
+        float range = tmax - tmin;
+        if (range < 1.0f) range = 1.0f;
+
+        int curve_y0 = hy0 + 70, curve_y1 = hy0 + 98;
+        for (int gy = 0; gy < 3; ++gy)
+            lcd_blend_rect(hx + 10, curve_y0 + gy * 14, hw - 20, 1, C_WHITE, 35);
+        int prev_px = 0, prev_py = 0;
+
+        for (int i = 0; i < n; i++) {
+            const weather_hourly_t *h = &hy->hourly[i];
+            int cx = n > 1 ? hx + 18 + i * (hw - 36) / (n - 1) : hx + hw / 2;
+
+            if ((i % 3) == 0) {
+                char hhmm[6] = {0};
+                if (h->fx_time && strlen(h->fx_time) >= 16) snprintf(hhmm, sizeof(hhmm), "%.5s", h->fx_time + 11);
+                int lw = (int)strlen(hhmm) * 8;
+                int label_x = cx - lw / 2;
+                if (label_x < hx + 10) label_x = hx + 10;
+                if (label_x + lw > hx + hw - 10) label_x = hx + hw - 10 - lw;
+                lcd_draw_text_compact(label_x, hy0 + 4, hhmm, C_WHITE2);
+            }
+
+            lcd_draw_weather_icon(cx, hy0 + 27, 17, h->text,
+                                 forecast_time_is_night(h->fx_time, fc), RGB(0x14,0x3E,0x62));
+
+            int temp = (int)lroundf(g_settings.unit_f ? h->temp * 9.0f / 5.0f + 32.0f : h->temp);
+            char tstr[8]; snprintf(tstr, sizeof(tstr), "%d", temp);
+            int twd = (int)strlen(tstr) * 8;
+            lcd_draw_text_compact(cx - twd / 2, hy0 + 45, tstr, C_WHITE);
+
+            int py = curve_y1 - (int)((h->temp - tmin) / range * (curve_y1 - curve_y0));
+            if (i > 0) {
+                lcd_draw_line(prev_px, prev_py + 1, cx, py + 1, RGB(0x52,0xC9,0xF4));
+                lcd_draw_line(prev_px, prev_py, cx, py, C_WHITE);
+            }
+            prev_px = cx; prev_py = py;
+        }
+        for (int i = 0; i < n; i++) {
+            const weather_hourly_t *h = &hy->hourly[i];
+            int cx = n > 1 ? hx + 18 + i * (hw - 36) / (n - 1) : hx + hw / 2;
+            int py = curve_y1 - (int)((h->temp - tmin) / range * (curve_y1 - curve_y0));
+            lcd_fill_circle(cx, py, 3, RGB(0x52,0xC9,0xF4));
+            lcd_fill_circle(cx, py, 2, C_WHITE);
+        }
+    }
+
+    draw_page_dots(PAGE_TODAY);
+
+    lcd_flush();
+}
+
+// ================= N 天预报页 =================
+void ui_render_forecast(const weather_forecast_t *fc, int days)
+{
+    lcd_gradient_v3(0, LCD_V_RES, 100, RGB(0x12,0x2B,0x50), RGB(0x1C,0x68,0x91), RGB(0x0F,0x2E,0x55));
+
+    char title[32];
+    snprintf(title, sizeof(title), "未来 %d 天预报", days);
+    lcd_draw_shadow_text(12, 7, title, C_WHITE, 1);
+
+    if (fc && fc->location_info && fc->location_info->city) {
+        int title_w = lcd_text_width(title, 1);
+        int max_city_w = LCD_H_RES - 24 - title_w - 12;
+        if (max_city_w < 0) max_city_w = 0;
+        char city_label[96];
+        fit_text_width(city_label, sizeof(city_label), fc->location_info->city, max_city_w);
+        int w = lcd_text_width(city_label, 1);
+        lcd_draw_text(LCD_H_RES - w - 12, 14, city_label, C_WHITE2, 1);
+    }
+
+    if (!fc || fc->day_count <= 0) {
+        int w = lcd_text_width("无预报数据", 1);
+        lcd_draw_text((LCD_H_RES - w) / 2, 120, "无预报数据", C_WHITE, 1);
+        draw_page_dots(days == 3 ? PAGE_3DAY : days == 5 ? PAGE_5DAY : PAGE_7DAY);
+        lcd_flush();
+        return;
+    }
+
+    int show = days < fc->day_count ? days : fc->day_count;
+    int top = 38, bottom = 222;
+    int row_h = (bottom - top) / show;
+
+    lcd_blend_round_rect(8, top - 2, 304, row_h * show + 4, 12, C_CARD, 195);
+
+    for (int i = 0; i < show; i++) {
+        const weather_daily_t *d = &fc->daily[i];
+        int y = top + i * row_h;
+        int cy = y + row_h / 2;
+
+        if (i > 0) lcd_fill_rect(20, y, 280, 1, C_SEP);
+
+        // 日期 + 星期（七行统一格式：周X MM-DD）
+        char dstr[24];
+        snprintf(dstr, sizeof(dstr), "%s %s",
+                 d->fx_date ? weekday_of(d->fx_date) : "",
+                 d->fx_date ? d->fx_date + 5 : "");
+        lcd_draw_text(20, cy - 8, dstr, C_WHITE, 1);
+
+        char tmax[12], tmin[12];
+        fmt_temp(tmax, sizeof(tmax), d->temp_max);
+        fmt_temp(tmin, sizeof(tmin), d->temp_min);
+        int wmin = lcd_text_width(tmin, 1);
+        int wmax = lcd_text_width(tmax, 1);
+        int temp_min_x = 304 - wmin;
+        int temp_max_x = temp_min_x - 8 - wmax;
+        int icon_sz = (row_h >= 44) ? 30 : (row_h >= 28 ? 22 : 16);
+        int icon_x = row_h < 28 ? 132 : 150;
+        int icon_gap = row_h < 28 ? 7 : 6;
+        lcd_draw_weather_icon(icon_x, cy, icon_sz, d->text_day, false, C_CARD);
+        lcd_draw_weather_icon(icon_x + icon_sz + icon_gap, cy, icon_sz, d->text_night, true, C_CARD);
+
+        int text_x = row_h < 28 ? icon_x + 2 * icon_sz + icon_gap + 3 : icon_x + 2 * icon_sz + 18;
+        int label_width = temp_max_x - 6 - text_x;
+        if (d->text_day && label_width >= 16) {
+            char weather_label[48];
+            fit_text_width(weather_label, sizeof(weather_label), d->text_day, label_width);
+            lcd_draw_text(text_x, cy - 8, weather_label, C_WHITE, 1);
+        }
+        lcd_draw_text(304 - wmin, cy - 8, tmin, C_WHITE2, 1);
+        lcd_draw_text(temp_max_x, cy - 8, tmax, C_WHITE, 1);
+
+        if (row_h >= 44 && d->wind_dir_day) {
+            char wstr[32];
+            snprintf(wstr, sizeof(wstr), "%s %s级", d->wind_dir_day, d->wind_scale_day ? d->wind_scale_day : "");
+            lcd_draw_text(20, cy + 9, wstr, C_WHITE2, 1);
+        }
+    }
+
+    draw_page_dots(days == 3 ? PAGE_3DAY : days == 5 ? PAGE_5DAY : PAGE_7DAY);
+    lcd_flush();
+}
+
+// ================= 设置与地区选择 =================
+#define SET_CITY_Y       45
+#define SET_BRIGHT_Y     98
+#define SET_LIST_Y       164
+#define PICK_ROWS        5
+#define PICK_ROW_H       30
+#define PICK_LIST_Y      62
+
+typedef enum { PICK_PROVINCE, PICK_CITY, PICK_DISTRICT } picker_level_t;
+static bool s_picker_open;
+static bool s_wifi_open, s_wifi_upper, s_wifi_symbols, s_wifi_notice;
+static bool s_wifi_show_scan;
+static int s_wifi_field;
+static char s_wifi_ssid[SETTINGS_WIFI_SSID_LEN];
+static char s_wifi_password[SETTINGS_WIFI_PASSWORD_LEN];
+static char s_wifi_scan_ssids[24][33];
+static int s_wifi_scan_count, s_wifi_scan_scroll;
+static picker_level_t s_picker_level;
+static int s_pick_province, s_pick_city, s_pick_scroll;
+static bool s_slider_dirty;
+static bool s_city_manager, s_picker_add_mode;
+static int s_city_scroll;
+
+static const char *selected_region(void)
+{
+    if (settings_location_id()) {
+        static char label[160];
+        snprintf(label, sizeof(label), "%s · %s", g_settings.city, g_settings.district);
+        return label;
+    }
+    return "自动定位";
+}
+
+static void draw_setting_background(void)
+{
+    lcd_gradient_v3(0, LCD_V_RES, 74, RGB(0x10,0x2B,0x50), RGB(0x12,0x55,0x83), RGB(0x0D,0x2C,0x52));
+    lcd_blend_circle(286, 22, 48, RGB(0x38,0xA8,0xDC), 55);
+}
+
+static void draw_brightness_slider(void)
+{
+    const int x0 = 115, x1 = 285, y = SET_BRIGHT_Y + 35;
+    lcd_fill_round_rect(x0, y - 3, x1 - x0, 6, 3, RGB(0x78,0xA9,0xC6));
+    int px = x0 + (x1 - x0) * g_settings.brightness / 100;
+    if (px > x0) lcd_fill_round_rect(x0, y - 3, px - x0, 6, 3, RGB(0x78,0xD7,0xFF));
+    lcd_fill_circle(px, y, 8, C_WHITE);
+    lcd_fill_circle(px, y, 4, RGB(0x44,0xB8,0xEC));
+}
+
+bool ui_render_settings(void)
+{
+    if (s_wifi_open) {
+        draw_setting_background();
+        lcd_draw_text(10, 3, "Wi-Fi 设置", C_WHITE, 2);
+        if (s_wifi_show_scan) {
+            lcd_draw_text(228, 11, "键盘", C_WHITE2, 1);
+            lcd_draw_text(276, 11, "返回", C_WHITE2, 1);
+            lcd_blend_round_rect(8, 37, 304, 181, 10, RGB(0x10,0x3E,0x68), 215);
+            if (!s_wifi_scan_count) {
+                lcd_draw_text(88, 115, "未找到热点", C_WHITE2, 1);
+            } else {
+                int first = s_wifi_scan_scroll;
+                if (first < 0) first = 0;
+                if (first > s_wifi_scan_count - 7) first = s_wifi_scan_count > 7 ? s_wifi_scan_count - 7 : 0;
+                s_wifi_scan_scroll = first;
+                for (int i = 0; i < 7 && first + i < s_wifi_scan_count; ++i) {
+                    int y = 43 + i * 25;
+                    if (i) lcd_blend_rect(20, y, 280, 1, C_WHITE, 30);
+                    char ssid_label[40];
+                    fit_text_width(ssid_label, sizeof(ssid_label), s_wifi_scan_ssids[first + i], 246);
+                    lcd_draw_text(22, y + 4, ssid_label, C_WHITE, 1);
+                    lcd_draw_text(282, y + 4, ">", C_WHITE2, 1);
+                }
+            }
+            lcd_draw_text_small(104, 225, "点选网络 · 上下滑动浏览", C_WHITE2);
+            lcd_flush();
+            return false;
+        }
+        lcd_draw_text(228, 11, "扫描", C_WHITE2, 1);
+        lcd_draw_text(276, 11, "返回", C_WHITE2, 1);
+        lcd_blend_round_rect(6, 32, 308, 29, 7, RGB(0x10,0x3E,0x68), 220);
+        lcd_blend_round_rect(6, 64, 308, 29, 7, RGB(0x10,0x3E,0x68), 220);
+        lcd_draw_text(12, 38, "SSID", C_WHITE2, 1);
+        lcd_draw_text(12, 70, "密码", C_WHITE2, 1);
+        lcd_fill_round_rect(62, 33 + s_wifi_field * 32, 2, 27, 1, RGB(0x8A,0xE2,0xFF));
+        char show_ssid[SETTINGS_WIFI_SSID_LEN + 1];
+        fit_text_width(show_ssid, sizeof(show_ssid), s_wifi_ssid, 232);
+        lcd_draw_text(70, 38, show_ssid, C_WHITE, 1);
+        int plen = (int)strlen(s_wifi_password);
+        if (plen > 20) plen = 20;
+        char masked[24]; memset(masked, '*', (size_t)plen); masked[plen] = '\0';
+        lcd_draw_text(70, 70, masked, C_WHITE, 1);
+        if (s_wifi_notice) lcd_draw_text_small(204, 72, "请输入名称", C_WARM);
+
+        static const char *const lower[] = { "1234567890", "qwertyuiop", "asdfghjkl;", "zxcvbnm,./" };
+        static const char *const upper[] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL:", "ZXCVBNM<>?" };
+        static const char *const symbols[] = { "!@#$%^&*()", "-_+=[]{}\\", ":;\"'<>?~`", "|,./\\\\%^" };
+        const char *const *layout = s_wifi_symbols ? symbols : (s_wifi_upper ? upper : lower);
+        for (int row = 0; row < 4; ++row) {
+            int y = 99 + row * 25;
+            for (int col = 0; col < 10; ++col) {
+                int x = 5 + col * 31;
+                lcd_blend_round_rect(x, y, 28, 22, 4, RGB(0x2D,0x6A,0x91), 220);
+                char key[2] = { layout[row][col], 0 };
+                int kw = lcd_text_width(key, 1);
+                lcd_draw_text(x + (28 - kw) / 2, y + 3, key, C_WHITE, 1);
+            }
+        }
+        static const char *actions[] = { "大小", "符号", "删除", "空格", "下项", "保存", "取消" };
+        for (int i = 0; i < 7; ++i) {
+            int x = 4 + i * 44;
+            lcd_blend_round_rect(x, 198, 41, 27, 5, i == 5 ? RGB(0x17,0x8B,0xB9) : RGB(0x2D,0x6A,0x91), 230);
+            lcd_draw_text(x + 4, 203, actions[i], C_WHITE, 1);
+        }
+        lcd_draw_text_small(52, 227, "可扫描中文网络，键盘输入密码", C_WHITE2);
+        lcd_flush();
+        return false;
+    }
+    if (s_picker_open) {
+        draw_setting_background();
+        lcd_draw_shadow_text(14, 8, s_picker_add_mode ? "添加城市" : "选择地区", C_WHITE, 1);
+        const char *crumb = s_picker_level == PICK_PROVINCE ? "中国大陆" :
+                            s_picker_level == PICK_CITY ? region_province_name(s_pick_province) :
+                            region_city_name(s_pick_province, s_pick_city);
+        lcd_draw_text(16, 37, crumb ? crumb : "", C_WHITE2, 1);
+        lcd_blend_round_rect(250, 5, 60, 27, 8, RGB(0x2D,0x6A,0x91), 230);
+        lcd_draw_text(263, 10, "返回", C_WHITE, 1);
+        lcd_blend_round_rect(9, 55, 302, 165, 12, RGB(0x10,0x3E,0x68), 205);
+        int count = s_picker_level == PICK_PROVINCE ? region_province_count() + 1 :
+                    s_picker_level == PICK_CITY ? region_city_count(s_pick_province) :
+                    region_district_count(s_pick_province, s_pick_city);
+        int first = s_pick_scroll;
+        if (first < 0) first = 0;
+        if (first > count - PICK_ROWS) first = count > PICK_ROWS ? count - PICK_ROWS : 0;
+        s_pick_scroll = first;
+        for (int i = 0; i < PICK_ROWS && first + i < count; ++i) {
+            int index = first + i, y = PICK_LIST_Y + i * PICK_ROW_H;
+            if (i) lcd_blend_rect(20, y, 280, 1, C_WHITE, 30);
+            const char *name = s_picker_level == PICK_PROVINCE ? (index == 0 ? "自动定位" : region_province_name(index - 1)) :
+                               s_picker_level == PICK_CITY ? region_city_name(s_pick_province, index) :
+                               region_district_name(s_pick_province, s_pick_city, index);
+            char name_label[96];
+            fit_text_width(name_label, sizeof(name_label), name ? name : "", 246);
+            lcd_draw_text(22, y + 6, name_label, C_WHITE, 1);
+            lcd_draw_text(282, y + 6, ">", C_WHITE2, 1);
+        }
+        lcd_draw_text_small(96, 225, "上下滑动浏览 · 点击选择", C_WHITE2);
+        lcd_flush();
+        return false;
+    }
+
+    draw_setting_background();
+    lcd_draw_text(14, 6, "设置", C_WHITE, 2);
+    // Small Latin glyphs keep the brand mark within the 320px display.
+    lcd_draw_text_small(258, 16, "WEATHER", C_WHITE2);
+
+    // 地区卡：单击进入逐级选择，不再循环城市
+    lcd_blend_round_rect(10, SET_CITY_Y, 300, 46, 12, RGB(0x1A,0x4E,0x78), 220);
+    lcd_draw_text(22, SET_CITY_Y + 7, "位置", C_WHITE2, 1);
+    char selected_label[160];
+    fit_text_width(selected_label, sizeof(selected_label), selected_region(), 246);
+    lcd_draw_text(22, SET_CITY_Y + 24, selected_label, C_WHITE, 1);
+    lcd_draw_text(278, SET_CITY_Y + 16, ">", C_WHITE, 1);
+
+    // 亮度卡：拖动滑杆实时预览，松手后保存
+    lcd_blend_round_rect(10, SET_BRIGHT_Y, 300, 52, 12, RGB(0x1A,0x4E,0x78), 220);
+    lcd_draw_text(22, SET_BRIGHT_Y + 7, "亮度", C_WHITE, 1);
+    char val[12]; snprintf(val, sizeof(val), "%d%%", g_settings.brightness);
+    lcd_draw_text(73, SET_BRIGHT_Y + 7, val, C_WHITE2, 1);
+    draw_brightness_slider();
+
+    const char *labels[] = { "Wi-Fi", "刷新", "温度", "息屏" };
+    char values[4][20];
+    snprintf(values[0], sizeof(values[0]), "%s", g_settings.wifi_ssid[0] ? "已设置" : "设置");
+    snprintf(values[1], sizeof(values[1]), "%d分钟", g_settings.refresh_min);
+    snprintf(values[2], sizeof(values[2]), "%s", g_settings.unit_f ? "°F" : "°C");
+    snprintf(values[3], sizeof(values[3]), "%s", g_settings.sleep_sec ? (g_settings.sleep_sec == 30 ? "30秒" : "60秒") : "常亮");
+    for (int i = 0; i < 4; ++i) {
+        int x = 8 + i * 77;
+        lcd_blend_round_rect(x, SET_LIST_Y, 72, 42, 9, RGB(0x1A,0x4E,0x78), 220);
+        lcd_draw_text(x + 7, SET_LIST_Y + 5, labels[i], C_WHITE2, 1);
+        lcd_draw_text(x + 7, SET_LIST_Y + 22, values[i], C_WHITE, 1);
+    }
+    lcd_draw_text_small(137, 216, "v1.2.2 · 点击设置", C_WHITE2);
+    draw_page_dots(PAGE_SETTINGS);
+    lcd_flush();
+    return false;
+}
+
+bool ui_city_manager_open(void) { return s_city_manager; }
+void ui_city_manager_show(void) { s_city_manager = true; s_city_scroll = 0; }
+void ui_city_manager_cancel(void) { s_city_manager = false; s_picker_add_mode = false; s_picker_open = false; }
+bool ui_city_manager_scroll(int direction)
+{
+    if (!s_city_manager || !direction) return false;
+    s_city_scroll += direction * 4;
+    int max = settings_city_count() > 6 ? settings_city_count() - 6 : 0;
+    if (s_city_scroll < 0) s_city_scroll = 0;
+    if (s_city_scroll > max) s_city_scroll = max;
+    return true;
+}
+bool ui_city_manager_delete_at(int x, int y)
+{
+    (void)x;
+    if (!s_city_manager || y < 40 || y >= 202) return false;
+    int index = s_city_scroll + (y - 40) / 27;
+    if (index < 0 || index >= settings_city_count()) return false;
+    settings_remove_city(index);
+    return true;
+}
+void ui_render_city_manager(void)
+{
+    draw_setting_background();
+    char title[32];
+    snprintf(title, sizeof(title), "城市管理 %d/10", settings_city_count());
+    // Keep the title at the font's native pixel size; scaling the bitmap made
+    // the Chinese strokes look blocky on the 320x240 panel.
+    lcd_draw_shadow_text(12, 8, title, C_WHITE, 1);
+    lcd_draw_text_small(275, 15, "完成", C_WHITE2);
+    int count = settings_city_count();
+    int first = s_city_scroll;
+    if (first > count - 6) first = count > 6 ? count - 6 : 0;
+    for (int row = 0; row < 6 && first + row < count; ++row) {
+        int index = first + row, y = 40 + row * 27;
+        const saved_city_t *c = settings_city_at(index);
+        bool active = index == settings_active_city();
+        lcd_blend_round_rect(8, y, 304, 24, 7, active ? RGB(0x1A,0x6F,0x9D) : RGB(0x10,0x3E,0x68), 220);
+        char location[160], name[160];
+        if (c && c->location_id[0])
+            snprintf(location, sizeof(location), "%s · %s", c->province, c->city);
+        else
+            strlcpy(location, "自动定位", sizeof(location));
+        // Fit by rendered pixel width and trim only whole UTF-8 code points.
+        // Byte-count precision formats (e.g. %.14s) can split Chinese glyphs.
+        fit_text_width(name, sizeof(name), location, 226);
+        lcd_draw_text(16, y + 4, name, C_WHITE, 1);
+        if (active) lcd_draw_text(256, y + 4, "当前", C_WHITE2, 1);
+        lcd_draw_text(286, y + 4, "×", C_WARM, 1);
+    }
+    lcd_blend_round_rect(9, 207, 142, 23, 7, RGB(0x17,0x78,0xA4), 230);
+    lcd_draw_text(22, 211, "+ 添加城市", C_WHITE, 1);
+    lcd_draw_text_small(177, 215, "点选城市切换 · × 删除", C_WHITE2);
+    lcd_flush();
+}
+settings_tap_result_t ui_city_manager_tap(int x, int y)
+{
+    if (!s_city_manager) return SETTINGS_TAP_NONE;
+    if (y < 34 && x > 255) { ui_city_manager_cancel(); return SETTINGS_TAP_CHANGED; }
+    if (y >= 207 && x < 155) {
+        if (settings_city_count() >= SETTINGS_MAX_CITIES) return SETTINGS_TAP_NONE;
+        s_picker_open = true; s_picker_add_mode = true; s_picker_level = PICK_PROVINCE; s_pick_scroll = 0;
+        return SETTINGS_TAP_CHANGED;
+    }
+    if (y < 40 || y >= 202) return SETTINGS_TAP_NONE;
+    int index = s_city_scroll + (y - 40) / 27;
+    if (index < 0 || index >= settings_city_count()) return SETTINGS_TAP_NONE;
+    if (x >= 276) {
+        settings_remove_city(index);
+        return SETTINGS_TAP_CHANGED;
+    }
+    bool changed = settings_activate_city(index);
+    ui_city_manager_cancel();
+    return changed ? SETTINGS_TAP_REFETCH : SETTINGS_TAP_CHANGED;
+}
+
+bool ui_settings_picker_open(void)
+{
+    return s_picker_open;
+}
+
+void ui_settings_picker_cancel(void)
+{
+    s_picker_open = false;
+    s_picker_add_mode = false;
+}
+
+bool ui_settings_wifi_open(void) { return s_wifi_open; }
+bool ui_settings_wifi_scanning(void) { return s_wifi_open && s_wifi_show_scan; }
+bool ui_settings_wifi_scroll(int direction)
+{
+    if (!ui_settings_wifi_scanning() || !direction) return false;
+    s_wifi_scan_scroll += direction * 5;
+    if (s_wifi_scan_scroll < 0) s_wifi_scan_scroll = 0;
+    return true;
+}
+void ui_settings_wifi_set_scan_results(const char *const ssids[], int count)
+{
+    s_wifi_scan_count = count < 0 ? 0 : count > 24 ? 24 : count;
+    s_wifi_scan_scroll = 0;
+    for (int i = 0; i < s_wifi_scan_count; ++i)
+        strlcpy(s_wifi_scan_ssids[i], ssids && ssids[i] ? ssids[i] : "", sizeof(s_wifi_scan_ssids[i]));
+    s_wifi_show_scan = true;
+}
+void ui_settings_wifi_cancel(void) { s_wifi_open = false; s_wifi_notice = false; }
+const char *ui_settings_wifi_ssid(void) { return s_wifi_ssid; }
+const char *ui_settings_wifi_password(void) { return s_wifi_password; }
+
+static void wifi_append(char *buffer, size_t capacity, char ch)
+{
+    size_t len = strlen(buffer);
+    if (len + 1 < capacity) { buffer[len] = ch; buffer[len + 1] = '\0'; }
+}
+
+settings_tap_result_t ui_settings_wifi_tap(int x, int y)
+{
+    if (!s_wifi_open) return SETTINGS_TAP_NONE;
+    if (s_wifi_show_scan) {
+        if (y < 30 && x >= 270) { s_wifi_open = false; return SETTINGS_TAP_WIFI_EDITED; }
+        if (y < 30 && x >= 220) { s_wifi_show_scan = false; return SETTINGS_TAP_WIFI_EDITED; }
+        if (y >= 43 && y < 218 && s_wifi_scan_count) {
+            int index = s_wifi_scan_scroll + (y - 43) / 25;
+            if (index >= 0 && index < s_wifi_scan_count) {
+                strlcpy(s_wifi_ssid, s_wifi_scan_ssids[index], sizeof(s_wifi_ssid));
+                s_wifi_show_scan = false;
+                s_wifi_field = 1;
+                return SETTINGS_TAP_WIFI_EDITED;
+            }
+        }
+        return SETTINGS_TAP_NONE;
+    }
+    if (y < 30 && x >= 270) { ui_settings_wifi_cancel(); return SETTINGS_TAP_WIFI_EDITED; }
+    if (y < 30 && x >= 220) return SETTINGS_TAP_WIFI_SCAN;
+    if (y >= 32 && y < 61) { s_wifi_field = 0; return SETTINGS_TAP_WIFI_EDITED; }
+    if (y >= 64 && y < 93) { s_wifi_field = 1; return SETTINGS_TAP_WIFI_EDITED; }
+    if (y >= 99 && y < 196 && x >= 5 && x < 315) {
+        int row = (y - 99) / 25;
+        int col = (x - 5) / 31;
+        static const char *const lower[] = { "1234567890", "qwertyuiop", "asdfghjkl;", "zxcvbnm,./" };
+        static const char *const upper[] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL:", "ZXCVBNM<>?" };
+        static const char *const symbols[] = { "!@#$%^&*()", "-_+=[]{}\\", ":;\"'<>?~`", "|,./\\\\%^" };
+        const char *const *layout = s_wifi_symbols ? symbols : (s_wifi_upper ? upper : lower);
+        char *target = s_wifi_field ? s_wifi_password : s_wifi_ssid;
+        size_t capacity = s_wifi_field ? sizeof(s_wifi_password) : sizeof(s_wifi_ssid);
+        if (row >= 0 && row < 4 && col >= 0 && col < 10) {
+            wifi_append(target, capacity, layout[row][col]);
+            s_wifi_notice = false;
+            return SETTINGS_TAP_WIFI_EDITED;
+        }
+    }
+    if (y >= 198 && y < 226 && x >= 4 && x < 312) {
+        int action = (x - 4) / 44;
+        char *target = s_wifi_field ? s_wifi_password : s_wifi_ssid;
+        switch (action) {
+        case 0: s_wifi_upper = !s_wifi_upper; break;
+        case 1: s_wifi_symbols = !s_wifi_symbols; break;
+        case 2: {
+            size_t n = strlen(target);
+            if (n) {
+                --n;
+                while (n && (((unsigned char)target[n] & 0xC0) == 0x80)) --n;
+                target[n] = '\0';
+            }
+            break;
+        }
+        case 3: wifi_append(target, s_wifi_field ? sizeof(s_wifi_password) : sizeof(s_wifi_ssid), ' '); break;
+        case 4: s_wifi_field = !s_wifi_field; break;
+        case 5:
+            if (!s_wifi_ssid[0]) { s_wifi_notice = true; return SETTINGS_TAP_WIFI_EDITED; }
+            s_wifi_open = false;
+            s_wifi_show_scan = false;
+            return SETTINGS_TAP_WIFI_SAVE;
+        case 6: ui_settings_wifi_cancel(); break;
+        default: break;
+        }
+        return SETTINGS_TAP_WIFI_EDITED;
+    }
+    return SETTINGS_TAP_NONE;
+}
+
+bool ui_settings_picker_scroll(int direction)
+{
+    if (!s_picker_open || !direction) return false;
+    s_pick_scroll += direction * (PICK_ROWS - 1);
+    if (s_pick_scroll < 0) s_pick_scroll = 0;
+    return true;
+}
+
+settings_tap_result_t ui_settings_picker_tap(int x, int y)
+{
+    if (!s_picker_open) return SETTINGS_TAP_NONE;
+    if (y < 38 && x >= 245) {
+        if (s_picker_level == PICK_DISTRICT) s_picker_level = PICK_CITY;
+        else if (s_picker_level == PICK_CITY) s_picker_level = PICK_PROVINCE;
+        else { s_picker_open = false; s_picker_add_mode = false; }
+        s_pick_scroll = 0;
+        return SETTINGS_TAP_CHANGED;
+    }
+    if (y < PICK_LIST_Y || y >= PICK_LIST_Y + PICK_ROWS * PICK_ROW_H) return SETTINGS_TAP_NONE;
+    int index = s_pick_scroll + (y - PICK_LIST_Y) / PICK_ROW_H;
+    if (s_picker_level == PICK_PROVINCE) {
+        if (index == 0) {
+            if (s_picker_add_mode) settings_add_region("", "", "", "");
+            else settings_use_auto_location();
+            s_picker_open = false; s_picker_add_mode = false; s_city_manager = false;
+            return SETTINGS_TAP_REFETCH;
+        }
+        // “自动定位”作为列表首项，其余省份索引减一
+        index -= 1;
+        if (index < 0 || index >= region_province_count()) return SETTINGS_TAP_NONE;
+        s_pick_province = index; s_picker_level = PICK_CITY; s_pick_scroll = 0;
+    } else if (s_picker_level == PICK_CITY) {
+        if (index < 0 || index >= region_city_count(s_pick_province)) return SETTINGS_TAP_NONE;
+        s_pick_city = index; s_picker_level = PICK_DISTRICT; s_pick_scroll = 0;
+    } else {
+        if (index < 0 || index >= region_district_count(s_pick_province, s_pick_city)) return SETTINGS_TAP_NONE;
+        const char *province = region_province_name(s_pick_province);
+        const char *city = region_city_name(s_pick_province, s_pick_city);
+        const char *district = region_district_name(s_pick_province, s_pick_city, index);
+        const char *id = region_location_id(s_pick_province, s_pick_city, index);
+        if (s_picker_add_mode) settings_add_region(province, city, district, id);
+        else settings_set_region(province, city, district, id);
+        s_picker_open = false; s_picker_add_mode = false; s_city_manager = false;
+        return SETTINGS_TAP_REFETCH;
+    }
+    return SETTINGS_TAP_CHANGED;
+}
+
+bool ui_settings_brightness_drag(int x, int y)
+{
+    if (y < SET_BRIGHT_Y + 22 || y > SET_BRIGHT_Y + 52 || x < 105 || x > 295) return false;
+    s_slider_dirty = true;
+    int value = (x - 115) * 100 / 170;
+    if (value < 1) value = 1;
+    if (value > 100) value = 100;
+    if (value == g_settings.brightness) return false;
+    g_settings.brightness = value;
+    lcd_backlight(value);
+    return true;
+}
+
+bool ui_settings_brightness_drag_end(void)
+{
+    bool changed = s_slider_dirty;
+    if (changed) settings_save();
+    s_slider_dirty = false;
+    return changed;
+}
+
+static int next_option(const int *values, int count, int current)
+{
+    for (int i = 0; i < count; ++i) {
+        if (values[i] == current) return values[(i + 1) % count];
+    }
+    // Recover to the first supported value if NVS contains an obsolete value.
+    return values[0];
+}
+
+settings_tap_result_t ui_settings_tap(int x, int y)
+{
+    if (x < 8 || x >= 310) return SETTINGS_TAP_NONE;
+    if (y >= SET_CITY_Y && y < SET_CITY_Y + 46) {
+        s_picker_open = true; s_picker_level = PICK_PROVINCE; s_pick_scroll = 0;
+        return SETTINGS_TAP_CHANGED;
+    }
+    if (y >= SET_BRIGHT_Y && y < SET_BRIGHT_Y + 52) return SETTINGS_TAP_NONE;
+    if (y < SET_LIST_Y || y >= SET_LIST_Y + 42) return SETTINGS_TAP_NONE;
+    int cell = -1;
+    for (int i = 0; i < 4; ++i) {
+        int left = 8 + i * 77;
+        if (x >= left && x < left + 72) { cell = i; break; }
+    }
+    switch (cell) {
+    case 0:
+        s_wifi_open = true;
+        s_wifi_field = 0; s_wifi_symbols = false; s_wifi_upper = false;
+        s_wifi_notice = false; s_wifi_show_scan = false;
+        strlcpy(s_wifi_ssid, g_settings.wifi_ssid, sizeof(s_wifi_ssid));
+        strlcpy(s_wifi_password, g_settings.wifi_password, sizeof(s_wifi_password));
+        return SETTINGS_TAP_WIFI_EDITED;
+    case 1:
+        g_settings.refresh_min = next_option(REFRESH_LEVELS, REFRESH_COUNT, g_settings.refresh_min);
+        return SETTINGS_TAP_REFETCH;
+    case 2: g_settings.unit_f = !g_settings.unit_f; return SETTINGS_TAP_CHANGED;
+    case 3:
+        g_settings.sleep_sec = next_option(SLEEP_LEVELS, SLEEP_COUNT, g_settings.sleep_sec);
+        return SETTINGS_TAP_CHANGED;
+    default: return SETTINGS_TAP_NONE;
+    }
+}

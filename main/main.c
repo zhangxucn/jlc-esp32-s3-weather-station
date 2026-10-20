@@ -442,4 +442,240 @@ void app_main(void)
 
         // 2) 渲染当前页面（开机默认 PAGE_TODAY；息屏时跳过）
         if (s_screen_on) {
-            rende
+            render_current_page();
+            ESP_LOGI(TAG, "显示页面: %d", s_page);
+        }
+
+        // 3) 事件循环：滑动/BOOT 翻页，设置页点击调设置，息屏倒计时，到点自动刷新
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(g_settings.refresh_min * 60 * 1000);
+        TickType_t alert_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(WEATHER_ALERT_REFRESH_MS);
+        TickType_t last_act = xTaskGetTickCount();
+        bool need_refetch = false;
+        bool need_wifi_reconnect = false;
+
+        while ((xTaskGetTickCount() < deadline || s_fetch_inflight || s_fetch_pending) && !need_refetch) {
+            weather_fetch_result_t fetched;
+            if (xQueueReceive(s_fetch_results, &fetched, 0) == pdTRUE) {
+                s_fetch_inflight = false;
+                if (fetched.generation == s_city_generation) {
+                    apply_weather_snapshot(&fetched.snapshot);
+                    ESP_LOGI(TAG, "城市天气更新完成");
+                    if (s_screen_on) render_current_page();
+                } else {
+                    free_weather_snapshot(&fetched.snapshot);
+                    s_fetch_pending = true;
+                    ESP_LOGI(TAG, "城市已再次切换，跳过过期天气结果");
+                }
+            }
+            if (need_wifi_reconnect && !s_fetch_inflight) {
+                ui_render_splash("正在连接新 WiFi...");
+                if (wifi_reconnect_preferred() != ESP_OK)
+                    ESP_LOGE(TAG, "新 WiFi 与备选网络均连接失败");
+                else
+                    ESP_LOGI(TAG, "WiFi 连接完成，刷新天气数据");
+                need_wifi_reconnect = false;
+                ++s_city_generation;
+                s_fetch_pending = true;
+            }
+            if (s_fetch_pending && !s_fetch_inflight && !need_wifi_reconnect)
+                request_city_weather();
+
+            EventBits_t bits = xEventGroupWaitBits(s_app_event_group, BTN_PRESSED_BIT,
+                                                   pdTRUE, pdFALSE, pdMS_TO_TICKS(30));
+
+            // Redraw the solar/lunar header once per local minute after SNTP
+            // has established a plausible system clock.
+            time_t clock_now = time(NULL);
+            if (clock_now >= 1577836800 && s_screen_on && s_page == PAGE_TODAY &&
+                !ui_city_manager_open() && !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                struct tm local_now;
+                if (localtime_r(&clock_now, &local_now)) {
+                    int minute_key = local_now.tm_year * 527040 + local_now.tm_yday * 1440 +
+                                     local_now.tm_hour * 60 + local_now.tm_min;
+                    if (minute_key != s_last_clock_minute) {
+                        s_last_clock_minute = minute_key;
+                        render_current_page();
+                    }
+                }
+            }
+
+            // 息屏倒计时（设置为 0 = 从不息屏）
+            if (s_screen_on && g_settings.sleep_sec > 0 &&
+                (xTaskGetTickCount() - last_act) > pdMS_TO_TICKS((uint32_t)g_settings.sleep_sec * 1000)) {
+                lcd_backlight(0);
+                s_screen_on = false;
+                ESP_LOGI(TAG, "%d 秒无操作，自动息屏", g_settings.sleep_sec);
+            }
+
+            if ((int32_t)(xTaskGetTickCount() - alert_deadline) >= 0) {
+                need_refetch = true;
+                alert_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(WEATHER_ALERT_REFRESH_MS);
+            }
+
+            // BOOT 键：亮屏=下一页，息屏=唤醒
+            if (bits & BTN_PRESSED_BIT) {
+                vTaskDelay(pdMS_TO_TICKS(350));          // 去抖 + 等待松手
+                xEventGroupClearBits(s_app_event_group, BTN_PRESSED_BIT);
+                last_act = xTaskGetTickCount();
+                if (!s_screen_on) {
+                    s_screen_on = true;
+                    lcd_backlight(g_settings.brightness);
+                    render_current_page();
+                    ESP_LOGI(TAG, "BOOT 唤醒，页面: %d", s_page);
+                } else {
+                    if (s_page == PAGE_SETTINGS) {
+                        ui_settings_brightness_drag_end();
+                        ui_settings_picker_cancel();
+                        ui_settings_wifi_cancel();
+                    }
+                    s_page = (s_page + 1) % PAGE_MAX;     // 今日→3天→5天→7天→设置→今日
+                    render_current_page();
+                    ESP_LOGI(TAG, "显示页面: %d", s_page);
+                }
+                continue;
+            }
+
+            // 触摸手势：上滑=下一页，下滑=上一页，息屏时触摸=唤醒
+            int tx = 0, ty = 0;
+            touch_gesture_t g = touch_poll(&tx, &ty);
+            if (g != TOUCH_NONE) {
+                last_act = xTaskGetTickCount();
+                if (!s_screen_on) {
+                    s_screen_on = true;
+                    lcd_backlight(g_settings.brightness);
+                    render_current_page();
+                    ESP_LOGI(TAG, "触摸唤醒，页面: %d", s_page);
+                } else if (g == TOUCH_SWIPE_UP && ui_settings_picker_open()) {
+                    ui_settings_picker_scroll(1);
+                    ui_render_settings();
+                } else if (g == TOUCH_SWIPE_DOWN && ui_settings_picker_open()) {
+                    ui_settings_picker_scroll(-1);
+                    ui_render_settings();
+                } else if (g == TOUCH_SWIPE_UP && ui_settings_wifi_scanning()) {
+                    ui_settings_wifi_scroll(1);
+                    ui_render_settings();
+                } else if (g == TOUCH_SWIPE_DOWN && ui_settings_wifi_scanning()) {
+                    ui_settings_wifi_scroll(-1);
+                    ui_render_settings();
+                } else if (g == TOUCH_SWIPE_UP) {
+                    if (ui_city_manager_open() && !ui_settings_picker_open()) {
+                        ui_city_manager_scroll(1); ui_render_city_manager(); continue;
+                    }
+                    if (s_page == PAGE_TODAY && settings_cycle_city(1)) {
+                        settings_save();
+                        ++s_city_generation;
+                        s_fetch_pending = true;
+                        ESP_LOGI(TAG, "上滑切换城市: %s·%s", settings_province(), settings_city());
+                        continue;
+                    }
+                    if (s_page == PAGE_SETTINGS && !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                        ui_settings_brightness_drag(tx, ty);
+                        if (ui_settings_brightness_drag_end()) {
+                            ui_render_settings();
+                            continue;
+                        }
+                    }
+                } else if (g == TOUCH_SWIPE_DOWN) {
+                    if (ui_city_manager_open() && !ui_settings_picker_open()) {
+                        ui_city_manager_scroll(-1); ui_render_city_manager(); continue;
+                    }
+                    if (s_page == PAGE_TODAY && settings_cycle_city(-1)) {
+                        settings_save();
+                        ++s_city_generation;
+                        s_fetch_pending = true;
+                        ESP_LOGI(TAG, "下滑切换城市: %s·%s", settings_province(), settings_city());
+                        continue;
+                    }
+                    if (s_page == PAGE_SETTINGS && !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                        ui_settings_brightness_drag(tx, ty);
+                        if (ui_settings_brightness_drag_end()) {
+                            ui_render_settings();
+                            continue;
+                        }
+                    }
+                } else if (g == TOUCH_SWIPE_LEFT) {
+                    if (s_page == PAGE_SETTINGS && !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                        ui_settings_brightness_drag(tx, ty);
+                        if (ui_settings_brightness_drag_end()) {
+                            ui_render_settings();
+                            continue;
+                        }
+                    }
+                    if (s_page == PAGE_SETTINGS) { ui_settings_picker_cancel(); ui_settings_wifi_cancel(); }
+                    if (ui_city_manager_open()) ui_city_manager_cancel();
+                    s_page = (s_page + 1) % PAGE_MAX;
+                    render_current_page();
+                    ESP_LOGI(TAG, "左滑，页面: %d", s_page);
+                } else if (g == TOUCH_SWIPE_RIGHT) {
+                    if (s_page == PAGE_SETTINGS && !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                        ui_settings_brightness_drag(tx, ty);
+                        if (ui_settings_brightness_drag_end()) {
+                            ui_render_settings();
+                            continue;
+                        }
+                    }
+                    if (s_page == PAGE_SETTINGS) { ui_settings_picker_cancel(); ui_settings_wifi_cancel(); }
+                    if (ui_city_manager_open()) ui_city_manager_cancel();
+                    s_page = (s_page + PAGE_MAX - 1) % PAGE_MAX;
+                    render_current_page();
+                    ESP_LOGI(TAG, "右滑，页面: %d", s_page);
+                } else if (g == TOUCH_LONG_PRESS && ui_city_manager_open() && !ui_settings_picker_open()) {
+                    if (ui_city_manager_delete_at(tx, ty)) {
+                        settings_save();
+                        ui_render_city_manager();
+                    }
+                } else if (g == TOUCH_LONG_PRESS && s_page == PAGE_TODAY &&
+                           tx >= 160 && ty <= 42) {
+                    ui_city_manager_show();
+                    ui_render_city_manager();
+                    ESP_LOGI(TAG, "长按顶部地区栏，打开城市管理");
+                } else if (g == TOUCH_TAP && (s_page == PAGE_SETTINGS || ui_city_manager_open())) {
+                    settings_tap_result_t result = ui_city_manager_open() && !ui_settings_picker_open()
+                        ? ui_city_manager_tap(tx, ty)
+                        : ui_settings_wifi_open()
+                        ? ui_settings_wifi_tap(tx, ty)
+                        : ui_settings_picker_open() ? ui_settings_picker_tap(tx, ty) : ui_settings_tap(tx, ty);
+                    if (result != SETTINGS_TAP_NONE) {
+                        if (result == SETTINGS_TAP_WIFI_SCAN) {
+                            wifi_scan_update_ui();
+                        } else if (result == SETTINGS_TAP_WIFI_SAVE) {
+                            settings_set_wifi(ui_settings_wifi_ssid(), ui_settings_wifi_password());
+                            settings_save();
+                            need_wifi_reconnect = true;
+                            need_refetch = true;
+                        } else {
+                            if (result == SETTINGS_TAP_REFETCH) need_refetch = true;
+                            if (result == SETTINGS_TAP_REFETCH ||
+                                (result == SETTINGS_TAP_CHANGED && !ui_settings_picker_open() && !ui_settings_wifi_open()))
+                                settings_save();
+                        }
+                        lcd_backlight(g_settings.brightness);
+                        if (ui_city_manager_open() && !ui_settings_picker_open()) ui_render_city_manager();
+                        else if (s_page == PAGE_SETTINGS || ui_settings_picker_open() || ui_settings_wifi_open()) ui_render_settings();
+                        else render_current_page();
+                        if (result == SETTINGS_TAP_WIFI_SAVE)
+                            ESP_LOGI(TAG, "WiFi 设置已保存，正在连接");
+                        else if (result != SETTINGS_TAP_WIFI_EDITED && result != SETTINGS_TAP_WIFI_SCAN)
+                            ESP_LOGI(TAG, "设置已保存%s", result == SETTINGS_TAP_REFETCH ? "，刷新数据" : "");
+                    } else {
+                        ESP_LOGD(TAG, "忽略设置页无效点击 x=%d y=%d", tx, ty);
+                    }
+                } else if (g == TOUCH_DRAG && s_screen_on && s_page == PAGE_SETTINGS &&
+                           !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                    if (ui_settings_brightness_drag(tx, ty)) ui_render_settings();
+                } else if (g == TOUCH_DRAG_END && s_page == PAGE_SETTINGS &&
+                           !ui_settings_picker_open() && !ui_settings_wifi_open()) {
+                    ui_settings_brightness_drag_end();
+                    ui_render_settings();
+                }
+            }
+
+            if (need_refetch) {
+                ++s_city_generation;
+                s_fetch_pending = true;
+                need_refetch = false;
+            }
+        }
+        // 到点或设置变更 → 回到循环顶部重新拉数据
+    }
+}
